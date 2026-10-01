@@ -101,16 +101,24 @@ class BridgeManager:
         async with self._lock:
             if self._active_ws == websocket:
                 self._active_ws = None
-                logger.warning("Userscript отключился от WebSocket-моста.")
+                logger.warning("Userscript временно отключился от WebSocket-моста.")
 
-                # Уведомляем все зависшие запросы об обрыве
-                for req_id, req_data in list(self._pending_requests.items()):
-                    queue: asyncio.Queue = req_data.get("queue")
-                    session_id = req_data.get("session_id")
-                    if session_id:
-                        self.add_failed_deletion(session_id)
-                    if queue:
-                        await queue.put({"type": "error", "error": "Userscript отключился во время выполнения запроса."})
+        # Даем льготный период (до 5 секунд) на автоматическое переподключение
+        # так как при переключении приложений на Android сокет может кратковременно переподключаться
+        if self._pending_requests:
+            await asyncio.sleep(5)
+            if self.is_connected:
+                logger.info("Userscript переподключился в пределах grace-периода.")
+                return
+
+        # Уведомляем зависшие запросы только если переподключение не состоялось
+        for req_id, req_data in list(self._pending_requests.items()):
+            queue: asyncio.Queue = req_data.get("queue")
+            session_id = req_data.get("session_id")
+            if session_id:
+                self.add_failed_deletion(session_id)
+            if queue:
+                await queue.put({"type": "error", "error": "Userscript отключился во время выполнения запроса."})
 
     async def _heartbeat_loop(self) -> None:
         """Фоновый цикл отправки ping каждые 12 секунд для предотвращения засыпания в Termux/браузере."""
