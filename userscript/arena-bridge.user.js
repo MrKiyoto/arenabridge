@@ -8,10 +8,22 @@
 // @match        https://*.arena.ai/*
 // @grant        none
 // @run-at       document-idle
+// @noframes
 // ==/UserScript==
 
 (function () {
     'use strict';
+
+    // Защита: не запускаться во фреймах (капчах, виджетах Cloudflare/reCAPTCHA)
+    if (window.top !== window.self) {
+        return;
+    }
+
+    // Защита: предотвратить двойную инициализацию в одном окне
+    if (window.__arenaBridgeStarted) {
+        return;
+    }
+    window.__arenaBridgeStarted = true;
 
     // =========================================================================
     // КОНФИГУРАЦИЯ И СЕЛЕКТОРЫ
@@ -400,8 +412,18 @@
     let reconnectTimeout = null;
 
     function connectBridge() {
-        if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-            return;
+        if (socket) {
+            if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+                return;
+            }
+            try {
+                socket.onopen = null;
+                socket.onclose = null;
+                socket.onerror = null;
+                socket.onmessage = null;
+                socket.close();
+            } catch (_) {}
+            socket = null;
         }
 
         console.log(`[arena-bridge] Подключение к ${CONFIG.wsUrl}...`);

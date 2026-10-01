@@ -1,11 +1,6 @@
 """
 Модуль WebSocket-моста (bridge) между Python-сервером и Userscript в браузере.
-Управляет:
-- WebSocket-соединением с Userscript (с heartbeat / ping-pong);
-- Передачей заданий на генерацию ответа;
-- Приемом потоковых чанков (стриминг);
-- Гарантированным удалением созданных чатов;
-- Очередью недоудалённых чатов (failed_deletions.json).
+Поддерживает несколько открытых вкладок, автоматический heartbeat и устойчивость к переподключениям.
 """
 
 import asyncio
@@ -22,7 +17,8 @@ logger = logging.getLogger("arena_bridge.bridge")
 
 class BridgeManager:
     def __init__(self, failed_deletions_file: str = "failed_deletions.json"):
-        self._active_ws: Optional[WebSocket] = None
+        self._active_sockets: Set[WebSocket] = set()
+        self._latest_ws: Optional[WebSocket] = None
         self._pending_requests: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._failed_deletions_file = Path(failed_deletions_file)
@@ -35,8 +31,14 @@ class BridgeManager:
 
     @property
     def is_connected(self) -> bool:
-        """Подключен ли сейчас userscript по WebSocket."""
-        return self._active_ws is not None
+        """Подключен ли сейчас хотя бы один userscript по WebSocket."""
+        return len(self._active_sockets) > 0
+
+    def _get_active_socket(self) -> Optional[WebSocket]:
+        """Возвращает актуальный активный сокет."""
+        if self._latest_ws and self._latest_ws in self._active_sockets:
+            return self._latest_ws
+        return next(iter(self._active_sockets), None) if self._active_sockets else None
 
     def _load_failed_deletions(self) -> Set[str]:
         """Загружает список ID сессий, которые не удалось удалить ранее."""
@@ -62,7 +64,6 @@ class BridgeManager:
     def add_failed_deletion(self, session_id: str) -> None:
         """Добавляет session_id в очередь повторного удаления."""
         if not session_id or session_id not in self._known_created_sessions:
-            # Безопасность: никогда не удаляем чаты, созданные не нами
             return
         self._failed_session_ids.add(session_id)
         self._save_failed_deletions()
@@ -79,14 +80,11 @@ class BridgeManager:
         """Регистрирует новое WebSocket-соединение от userscript."""
         await websocket.accept()
         async with self._lock:
-            if self._active_ws is not None:
-                try:
-                    await self._active_ws.close(code=1000, reason="Новое подключение userscript")
-                except Exception:
-                    pass
-            self._active_ws = websocket
+            # Не закрываем предыдущие сокеты принудительно, а добавляем в пул
+            self._active_sockets.add(websocket)
+            self._latest_ws = websocket
             self._last_heartbeat = time.time()
-            logger.info("Userscript успешно подключен к WebSocket-мосту.")
+            logger.info(f"Userscript подключен к мосту (активных соединений: {len(self._active_sockets)}).")
 
         # Если есть недоудалённые чаты, отправляем запрос на их удаление
         if self._failed_session_ids:
@@ -99,38 +97,40 @@ class BridgeManager:
     async def unregister_connection(self, websocket: WebSocket) -> None:
         """Отключает WebSocket."""
         async with self._lock:
-            if self._active_ws == websocket:
-                self._active_ws = None
-                logger.warning("Userscript временно отключился от WebSocket-моста.")
+            self._active_sockets.discard(websocket)
+            if self._latest_ws == websocket:
+                self._latest_ws = next(iter(self._active_sockets), None)
+            logger.info(f"Userscript отключился (осталось активных: {len(self._active_sockets)}).")
 
-        # Даем льготный период (до 5 секунд) на автоматическое переподключение
-        # так как при переключении приложений на Android сокет может кратковременно переподключаться
-        if self._pending_requests:
-            await asyncio.sleep(5)
+        # Если все сокеты закрылись и есть активные запросы, даем 6 секунд на переподключение
+        if not self._active_sockets and self._pending_requests:
+            await asyncio.sleep(6)
             if self.is_connected:
                 logger.info("Userscript переподключился в пределах grace-периода.")
                 return
 
-        # Уведомляем зависшие запросы только если переподключение не состоялось
-        for req_id, req_data in list(self._pending_requests.items()):
-            queue: asyncio.Queue = req_data.get("queue")
-            session_id = req_data.get("session_id")
-            if session_id:
-                self.add_failed_deletion(session_id)
-            if queue:
-                await queue.put({"type": "error", "error": "Userscript отключился во время выполнения запроса."})
+            for req_id, req_data in list(self._pending_requests.items()):
+                queue: asyncio.Queue = req_data.get("queue")
+                session_id = req_data.get("session_id")
+                if session_id:
+                    self.add_failed_deletion(session_id)
+                if queue:
+                    await queue.put({"type": "error", "error": "Userscript отключился во время выполнения запроса."})
 
     async def _heartbeat_loop(self) -> None:
         """Фоновый цикл отправки ping каждые 12 секунд для предотвращения засыпания в Termux/браузере."""
         try:
             while self.is_connected:
                 await asyncio.sleep(12)
-                ws = self._active_ws
-                if ws:
+                async with self._lock:
+                    sockets = list(self._active_sockets)
+
+                for ws in sockets:
                     try:
                         await ws.send_text(json.dumps({"action": "ping"}))
                     except Exception:
-                        break
+                        async with self._lock:
+                            self._active_sockets.discard(ws)
         except asyncio.CancelledError:
             pass
 
@@ -149,7 +149,6 @@ class BridgeManager:
 
         req_id = data.get("id")
         if not req_id or req_id not in self._pending_requests:
-            # Обработка системных сообщений вне конкретного запроса
             if msg_type == "pending_deleted":
                 deleted_ids = data.get("sessionIds", [])
                 for sid in deleted_ids:
@@ -159,7 +158,6 @@ class BridgeManager:
         req_info = self._pending_requests[req_id]
         queue: asyncio.Queue = req_info["queue"]
 
-        # Если userscript сообщил ID созданной сессии, сохраняем для безопасного удаления
         session_id = data.get("sessionId")
         if session_id:
             req_info["session_id"] = session_id
@@ -173,15 +171,15 @@ class BridgeManager:
 
     async def _trigger_pending_deletions(self) -> None:
         """Отправляет userscript'у задание на удаление накопленных незакрытых сессий."""
-        if not self.is_connected or not self._failed_session_ids:
+        ws = self._get_active_socket()
+        if not ws or not self._failed_session_ids:
             return
         try:
             payload = {
                 "action": "delete_pending",
                 "sessionIds": list(self._failed_session_ids),
             }
-            if self._active_ws:
-                await self._active_ws.send_text(json.dumps(payload))
+            await ws.send_text(json.dumps(payload))
         except Exception as e:
             logger.warning(f"Не удалось отправить запрос на повторное удаление чатов: {e}")
 
@@ -193,7 +191,8 @@ class BridgeManager:
         delete_chat: bool = True,
     ) -> None:
         """Отправляет userscript'у задание создать чат и отправить сообщение."""
-        if not self.is_connected or not self._active_ws:
+        ws = self._get_active_socket()
+        if not ws:
             raise ConnectionError("Userscript не подключен к серверу.")
 
         payload = {
@@ -203,7 +202,7 @@ class BridgeManager:
             "prompt": prompt,
             "deleteChat": delete_chat,
         }
-        await self._active_ws.send_text(json.dumps(payload))
+        await ws.send_text(json.dumps(payload))
 
     async def stream_chat(
         self,
@@ -228,7 +227,6 @@ class BridgeManager:
         }
 
         try:
-            # Отправка задачи в userscript
             await self.send_chat_task(
                 request_id=request_id,
                 model_id=model_id,
@@ -246,7 +244,6 @@ class BridgeManager:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=min(remaining_time, 30.0))
                 except asyncio.TimeoutError:
-                    # Проверяем, жива ли еще связь
                     if not self.is_connected:
                         raise ConnectionError("Userscript отключился во время ожидания чанка.")
                     continue
@@ -260,7 +257,6 @@ class BridgeManager:
                         "finish_reason": None,
                     }
                 elif event_type == "done":
-                    # Завершение генерации
                     session_id = event.get("sessionId")
                     yield {
                         "content": None,
@@ -274,15 +270,14 @@ class BridgeManager:
                     raise RuntimeError(err_msg)
 
         finally:
-            # Очистка и гарантия удаления чата
             req_info = self._pending_requests.pop(request_id, {})
             session_id = req_info.get("session_id")
 
             if delete_chat and session_id:
-                # Если userscript всё ещё подключен, пробуем отправить команду на удаление
-                if self.is_connected and self._active_ws:
+                ws = self._get_active_socket()
+                if ws:
                     try:
-                        await self._active_ws.send_text(
+                        await ws.send_text(
                             json.dumps({
                                 "action": "delete_chat",
                                 "id": request_id,
