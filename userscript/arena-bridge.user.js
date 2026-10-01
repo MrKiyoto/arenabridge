@@ -267,7 +267,6 @@
         const sessionId = generateUUIDv7();
         const userMsgId = generateUUIDv7();
         const modelAMsgId = generateUUIDv7();
-        const modelBMsgId = generateUUIDv7();
 
         // Сообщаем серверу ID создаваемой сессии для гарантии удаления
         ws.send(JSON.stringify({
@@ -282,10 +281,8 @@
             id: sessionId,
             mode: "direct-battle",
             modelAId: modelId,
-            modelBId: void 0,
             userMessageId: userMsgId,
             modelAMessageId: modelAMsgId,
-            modelBMessageId: modelBMsgId,
             userMessage: {
                 content: prompt,
                 experimental_attachments: [],
