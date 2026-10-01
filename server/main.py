@@ -1,24 +1,30 @@
 """
 Основной модуль сервера arena-bridge.
-Запускает FastAPI сервер с поддержкой:
-- OpenAI-совместимого HTTP API (/v1/models, /v1/chat/completions);
-- WebSocket-моста для Userscript (/ws);
-- Раздачи скрипта (/userscript.user.js);
-- Страницы статуса (/) и проверки здоровья (/health).
+Построен на легковесном Starlette (без Rust/pydantic-core для совместимости с Termux/Android).
+Поддерживает:
+- OpenAI-совместимый HTTP API (/v1/models, /v1/chat/completions);
+- WebSocket-мост для Userscript (/ws);
+- Раздачу скрипта (/userscript.user.js);
+- Страницу статуса (/) и проверку здоровья (/health).
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .bridge import BridgeManager
 from .config import Config, load_config
@@ -53,92 +59,31 @@ request_queue = RequestQueue(
     default_timeout=config.request_timeout,
 )
 
-app = FastAPI(
-    title="arena-bridge",
-    description="Local OpenAI-compatible API bridge to arena.ai for Android/Termux",
-    version="1.0.0",
-)
 
-# Разрешаем CORS для всех клиентов (NextChat, Chatbox, OpenWebUI и др.)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# --- Модели валидации Pydantic ---
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: List[Dict[str, Any]]
-    stream: Optional[bool] = False
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    max_tokens: Optional[int] = None
-    presence_penalty: Optional[float] = None
-    frequency_penalty: Optional[float] = None
-    tools: Optional[List[Any]] = None
-    tool_choice: Optional[Any] = None
-
-    model_config = ConfigDict(extra="ignore")  # Игнорируем любые дополнительные параметры OpenAI
-
-
-# --- Проверка авторизации ---
-
-async def verify_api_key(authorization: Optional[str] = Header(None)) -> str:
+def verify_api_key(request: Request) -> Optional[str]:
     """Проверяет заголовок Authorization: Bearer <key>."""
     expected_key = config.api_key
     if not expected_key:
         return "anonymous"
 
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=make_openai_error_response(
-                "API key required. Provide 'Authorization: Bearer <key>' header.",
-                error_type="invalid_request_error",
-                code="invalid_api_key",
-            ),
-        )
+    auth_header = request.headers.get("authorization")
+    if not auth_header:
+        return None
 
-    parts = authorization.strip().split(" ", 1)
+    parts = auth_header.strip().split(" ", 1)
     token = parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else parts[0]
 
     if token != expected_key:
         logger.warning("Попытка доступа с неверным API-ключом.")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=make_openai_error_response(
-                "Invalid API key provided.",
-                error_type="invalid_request_error",
-                code="invalid_api_key",
-            ),
-        )
+        return None
 
     return token
 
 
-# --- Обработчик ошибок HTTP ---
+# --- Обработчики маршрутов ---
 
-@app.exception_handler(HTTPException)
-async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    """Возвращает ошибки всегда в стандартном формате OpenAI."""
-    if isinstance(exc.detail, dict) and "error" in exc.detail:
-        return JSONResponse(status_code=exc.status_code, content=exc.detail)
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=make_openai_error_response(str(exc.detail), code=str(exc.status_code)),
-    )
-
-
-# --- Эндпоинты ---
-
-@app.get("/", response_class=HTMLResponse)
-async def status_page():
-    """Простая страница статуса и инструкции."""
+async def status_page(request: Request):
+    """Страница статуса и быстрой инструкции."""
     ws_status = "🟢 Подключён" if bridge_manager.is_connected else "🔴 Ожидание подключения"
     models_count = len(await model_catalog.get_models())
 
@@ -184,24 +129,22 @@ async def status_page():
     return HTMLResponse(content=html_content)
 
 
-@app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     """Эндпоинт проверки здоровья сервиса."""
-    return {
+    return JSONResponse({
         "status": "ok",
         "userscript_connected": bridge_manager.is_connected,
         "queue_length": request_queue.waiting_count,
         "active_requests": request_queue.active_count,
         "version": "1.0.0",
-    }
+    })
 
 
-@app.get("/userscript.user.js")
-async def get_userscript():
+async def get_userscript(request: Request):
     """Отдает файл userscript с динамически подставленным хостом и портом сервера."""
     userscript_path = Path(__file__).resolve().parent.parent / "userscript" / "arena-bridge.user.js"
     if not userscript_path.exists():
-        raise HTTPException(status_code=404, detail="Файл userscript не найден")
+        return JSONResponse(status_code=404, content=make_openai_error_response("Файл userscript не найден", code="not_found"))
 
     with open(userscript_path, "r", encoding="utf-8") as f:
         content = f.read()
@@ -211,14 +154,22 @@ async def get_userscript():
     return PlainTextResponse(content=content, media_type="application/javascript")
 
 
-@app.get("/v1/models")
-async def list_models(user: str = Depends(verify_api_key)):
+async def list_models(request: Request):
     """Возвращает список доступных моделей arena.ai в формате OpenAI."""
+    user = verify_api_key(request)
+    if not user:
+        return JSONResponse(
+            status_code=401,
+            content=make_openai_error_response(
+                "Invalid API key provided.",
+                error_type="invalid_request_error",
+                code="invalid_api_key",
+            ),
+        )
     models = await model_catalog.get_models()
-    return model_catalog.format_openai_models_list(models)
+    return JSONResponse(model_catalog.format_openai_models_list(models))
 
 
-@app.websocket("/ws")
 async def websocket_bridge_endpoint(websocket: WebSocket):
     """WebSocket эндпоинт для связи с Userscript."""
     await bridge_manager.register_connection(websocket)
@@ -233,76 +184,100 @@ async def websocket_bridge_endpoint(websocket: WebSocket):
         await bridge_manager.unregister_connection(websocket)
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(
-    req: ChatCompletionRequest,
-    raw_request: Request,
-    user: str = Depends(verify_api_key),
-):
+async def chat_completions(request: Request):
     """
     Обработчик OpenAI Chat Completions (stream: true и stream: false).
     Перенаправляет запрос в Userscript на arena.ai и возвращает ответ.
     """
-    # 1. Проверяем наличие подключенного userscript
+    # 1. Авторизация
+    user = verify_api_key(request)
+    if not user:
+        return JSONResponse(
+            status_code=401,
+            content=make_openai_error_response(
+                "Invalid API key provided.",
+                error_type="invalid_request_error",
+                code="invalid_api_key",
+            ),
+        )
+
+    # 2. Проверка userscript
     if not bridge_manager.is_connected:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=make_openai_error_response(
+        return JSONResponse(
+            status_code=503,
+            content=make_openai_error_response(
                 "Откройте вкладку arena.ai с включённым userscript",
                 error_type="bridge_unavailable",
                 code="service_unavailable",
             ),
         )
 
-    # 2. Проверяем валидность модели
-    model_uuid = await model_catalog.resolve_model_id(req.model)
+    # 3. Парсинг тела JSON
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content=make_openai_error_response(
+                "Invalid JSON body in request",
+                error_type="invalid_request_error",
+            ),
+        )
+
+    model_name = str(body.get("model", "")).strip()
+    messages = body.get("messages", [])
+    stream = bool(body.get("stream", False))
+
+    if not model_name:
+        return JSONResponse(
+            status_code=400,
+            content=make_openai_error_response("Поле 'model' обязательно.", error_type="invalid_request_error"),
+        )
+
+    if not isinstance(messages, list) or not messages:
+        return JSONResponse(
+            status_code=400,
+            content=make_openai_error_response("Поле 'messages' должно быть непустым списком.", error_type="invalid_request_error"),
+        )
+
+    # 4. Проверяем валидность модели
+    model_uuid = await model_catalog.resolve_model_id(model_name)
     if not model_uuid:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=make_openai_error_response(
-                f"Модель '{req.model}' не найдена в каталоге arena.ai. Проверьте список через GET /v1/models.",
+        return JSONResponse(
+            status_code=404,
+            content=make_openai_error_response(
+                f"Модель '{model_name}' не найдена в каталоге arena.ai. Проверьте список через GET /v1/models.",
                 error_type="invalid_request_error",
                 code="model_not_found",
             ),
         )
 
-    # 3. Склеиваем сообщения в единый промпт
+    # 5. Склеиваем сообщения в единый промпт
     try:
-        prompt_text = format_messages_to_prompt(req.messages, format_type=config.prompt_format)
+        prompt_text = format_messages_to_prompt(messages, format_type=config.prompt_format)
     except UnsupportedModalityError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=make_openai_error_response(str(e), error_type="invalid_request_error", code="unsupported_modality"),
+        return JSONResponse(
+            status_code=400,
+            content=make_openai_error_response(str(e), error_type="invalid_request_error", code="unsupported_modality"),
         )
 
     if not prompt_text.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=make_openai_error_response("Сообщение не может быть пустым.", error_type="invalid_request_error"),
+        return JSONResponse(
+            status_code=400,
+            content=make_openai_error_response("Сообщение не может быть пустым.", error_type="invalid_request_error"),
         )
 
     request_id = str(uuid.uuid4())
-    logger.info(f"Запрос {request_id[:8]} [модель={req.model}, stream={req.stream}] поставлен в очередь.")
+    logger.info(f"Запрос {request_id[:8]} [модель={model_name}, stream={stream}] поставлен в очередь.")
 
-    # Логируем игнорируемые параметры (для соответствия ТЗ)
-    ignored_params = []
-    if req.temperature is not None:
-        ignored_params.append("temperature")
-    if req.max_tokens is not None:
-        ignored_params.append("max_tokens")
-    if req.tools is not None:
-        ignored_params.append("tools")
-    if ignored_params:
-        logger.debug(f"Параметры {ignored_params} приняты и проигнорированы веб-интерфейсом arena.ai.")
-
-    # 4. Обработка стриминга (stream: true)
-    if req.stream:
+    # 6. Обработка стриминга (stream: true)
+    if stream:
         async def event_generator():
             try:
                 # Вход в очередь с таймаутом
                 async with request_queue.acquire(timeout=config.request_timeout):
                     # Отправляем первый начальный чанк с ролью
-                    yield format_sse_chunk(chunk_id=request_id, model=req.model, role="assistant")
+                    yield format_sse_chunk(chunk_id=request_id, model=model_name, role="assistant")
 
                     async for chunk in bridge_manager.stream_chat(
                         request_id=request_id,
@@ -311,8 +286,7 @@ async def chat_completions(
                         delete_chat=config.delete_chats,
                         timeout=config.request_timeout,
                     ):
-                        # Проверка отключения клиента
-                        if await raw_request.is_disconnected():
+                        if await request.is_disconnected():
                             logger.info(f"Клиент отключился до завершения стрима {request_id[:8]}.")
                             break
 
@@ -323,7 +297,7 @@ async def chat_completions(
                         if content or reasoning or finish_reason:
                             yield format_sse_chunk(
                                 chunk_id=request_id,
-                                model=req.model,
+                                model=model_name,
                                 content=content,
                                 reasoning_content=reasoning,
                                 finish_reason=finish_reason,
@@ -350,7 +324,7 @@ async def chat_completions(
             },
         )
 
-    # 5. Обработка non-stream (stream: false)
+    # 7. Обработка non-stream (stream: false)
     else:
         try:
             full_content_parts = []
@@ -376,22 +350,45 @@ async def chat_completions(
 
             logger.info(f"Запрос {request_id[:8]} успешно выполнен (длина: {len(full_text)} симв).")
 
-            return format_completion_response(
+            return JSONResponse(format_completion_response(
                 request_id=request_id,
-                model=req.model,
+                model=model_name,
                 content=full_text,
                 reasoning_content=full_reasoning,
                 finish_reason="stop",
-            )
+            ))
 
         except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail=make_openai_error_response("Превышено время ожидания ответа от arena.ai", code="timeout"),
+            return JSONResponse(
+                status_code=504,
+                content=make_openai_error_response("Превышено время ожидания ответа от arena.ai", code="timeout"),
             )
         except Exception as e:
             logger.error(f"Ошибка выполнения non-stream запроса {request_id[:8]}: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=make_openai_error_response(str(e), error_type="server_error"),
+            return JSONResponse(
+                status_code=500,
+                content=make_openai_error_response(str(e), error_type="server_error"),
             )
+
+
+# Настройка маршрутов и middleware приложения Starlette
+routes = [
+    Route("/", status_page, methods=["GET"]),
+    Route("/health", health_check, methods=["GET"]),
+    Route("/userscript.user.js", get_userscript, methods=["GET"]),
+    Route("/v1/models", list_models, methods=["GET"]),
+    Route("/v1/chat/completions", chat_completions, methods=["POST"]),
+    WebSocketRoute("/ws", websocket_bridge_endpoint),
+]
+
+middleware = [
+    Middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+]
+
+app = Starlette(routes=routes, middleware=middleware)
