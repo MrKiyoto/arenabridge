@@ -291,7 +291,7 @@
                 experimental_attachments: [],
                 metadata: {}
             },
-            modality: "text",
+            modality: "chat",
             recaptchaV3Token: recaptchaToken
         };
 
