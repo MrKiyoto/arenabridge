@@ -15,7 +15,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set
-from fastapi import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 logger = logging.getLogger("arena_bridge.bridge")
 
