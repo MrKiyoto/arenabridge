@@ -280,7 +280,7 @@
 
         const payload = {
             id: sessionId,
-            mode: "direct",
+            mode: "direct_battle",
             modelAId: modelId,
             modelBId: void 0,
             userMessageId: userMsgId,
