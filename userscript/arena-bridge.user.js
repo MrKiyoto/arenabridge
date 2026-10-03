@@ -376,14 +376,14 @@
             // 1) Первая попытка с v3-токеном
             let response = await makeRequest(null);
 
-            // 2) Если 429 "prompt failed" — arena.ai требует reCAPTCHA v2
-            if (response.status === 429) {
+            // 2) Если 429 "prompt failed" или 403 "recaptcha validation failed" — arena.ai требует reCAPTCHA v2
+            if (response.status === 429 || response.status === 403) {
                 let errBody = null;
                 try { errBody = await response.clone().json(); } catch (_) {}
                 const errMsg = errBody?.error || '';
 
                 if (errMsg === 'prompt failed' || errMsg.includes('recaptcha')) {
-                    console.log('[arena-bridge] ⚠️ Сервер запросил reCAPTCHA v2 (prompt failed)');
+                    console.log(`[arena-bridge] ⚠️ Сервер запросил reCAPTCHA v2 (${response.status}: ${errMsg})`);
                     updateUI('busy', '🔒 CAPTCHA required...');
 
                     try {
