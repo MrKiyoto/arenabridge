@@ -36,10 +36,10 @@
         reconnectInitialDelayMs: 1500,
         reconnectMaxDelayMs: 10000,
 
-        // Актуальный reCAPTCHA Enterprise sitekey из бандлов arena.ai
+        // Актуальный reCAPTCHA Enterprise sitekey (v3) из бандлов arena.ai
         recaptchaEnterpriseSitekey: "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0",
-        // Резервный v3 sitekey
-        recaptchaSitekey: "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I",
+        // reCAPTCHA Enterprise sitekey (v2 checkbox fallback)
+        recaptchaV2Sitekey: "6Le3_cYsAAAAAGwWOK2RLDgNI15Bh8C0yLBOL1yL",
         recaptchaAction: "chat_submit",
 
         // Next.js Server Action ID для удаления чата (deleteEvaluationSession)
@@ -181,12 +181,12 @@
             return null;
         }
 
-        // 1. Проверяем grecaptcha.enterprise (актуальный на arena.ai)
+        // grecaptcha.enterprise (актуальный на arena.ai)
         if (grecaptcha.enterprise && typeof grecaptcha.enterprise.ready === 'function') {
             try {
                 const token = await new Promise((resolve) => {
                     const timer = setTimeout(() => {
-                        console.warn('[arena-bridge] grecaptcha.enterprise таймаут');
+                        console.warn('[arena-bridge] grecaptcha.enterprise таймаут (6с)');
                         resolve(null);
                     }, 6000);
 
@@ -205,22 +205,85 @@
                         }
                     });
                 });
-                if (token) return token;
+                console.log(`[arena-bridge] reCAPTCHA v3 токен: ${token ? token.slice(0, 20) + '...' : 'NULL'}`);
+                return token; // может быть null — это ОК, сервер попросит v2
             } catch (e) {
                 console.warn('[arena-bridge] Ошибка enterprise reCAPTCHA:', e);
             }
         }
 
-        // 2. Резервный вызов стандартного grecaptcha
-        if (typeof grecaptcha.execute === 'function') {
-            try {
-                return await grecaptcha.execute(CONFIG.recaptchaSitekey, { action: CONFIG.recaptchaAction });
-            } catch (e) {
-                console.warn('[arena-bridge] Резервный execute вернул ошибку:', e);
-            }
+        console.warn('[arena-bridge] grecaptcha.enterprise не доступен');
+        return null;
+    }
+
+    // =========================================================================
+    // reCAPTCHA v2 FALLBACK (checkbox-капча, показывается при "prompt failed")
+    // =========================================================================
+    function getRecaptchaV2Token() {
+        const w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+        const grecaptcha = w.grecaptcha;
+
+        if (!grecaptcha?.enterprise?.render) {
+            console.error('[arena-bridge] grecaptcha.enterprise.render недоступен для v2 fallback');
+            return Promise.reject(new Error('reCAPTCHA v2 unavailable'));
         }
 
-        return null;
+        return new Promise((resolve, reject) => {
+            // Создаём оверлей с капчей
+            const overlay = document.createElement('div');
+            overlay.id = 'arena-bridge-captcha-overlay';
+            overlay.style.cssText = `
+                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                background: rgba(0,0,0,0.7); z-index: 9999999;
+                display: flex; flex-direction: column; align-items: center; justify-content: center;
+                gap: 16px;
+            `;
+            overlay.innerHTML = `
+                <div style="background:#1e293b;border-radius:12px;padding:24px;max-width:340px;text-align:center;color:#f8fafc;font-family:system-ui,sans-serif;">
+                    <p style="margin:0 0 12px;font-size:14px;font-weight:600;">🔒 Arena.ai требует проверку</p>
+                    <p style="margin:0 0 16px;font-size:12px;color:#94a3b8;">Решите капчу для продолжения</p>
+                    <div id="arena-bridge-recaptcha-container" style="display:flex;justify-content:center;"></div>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+
+            const container = document.getElementById('arena-bridge-recaptcha-container');
+
+            const timeout = setTimeout(() => {
+                cleanup();
+                console.warn('[arena-bridge] reCAPTCHA v2 таймаут (60с)');
+                reject(new Error('reCAPTCHA v2 timed out'));
+            }, 60000);
+
+            function cleanup() {
+                clearTimeout(timeout);
+                const el = document.getElementById('arena-bridge-captcha-overlay');
+                if (el) el.remove();
+            }
+
+            try {
+                updateUI('busy', '🔒 Solve CAPTCHA on arena.ai tab!');
+                grecaptcha.enterprise.render(container, {
+                    sitekey: CONFIG.recaptchaV2Sitekey,
+                    callback: (token) => {
+                        console.log(`[arena-bridge] reCAPTCHA v2 решена! Токен: ${token?.slice(0, 20)}...`);
+                        cleanup();
+                        resolve(token);
+                    },
+                    'error-callback': () => {
+                        console.error('[arena-bridge] reCAPTCHA v2 ошибка рендера');
+                        cleanup();
+                        reject(new Error('reCAPTCHA v2 render failed'));
+                    },
+                    theme: 'dark'
+                });
+                console.log('[arena-bridge] 🔒 reCAPTCHA v2 показана — жду решения от пользователя');
+            } catch (err) {
+                console.error('[arena-bridge] Ошибка рендера reCAPTCHA v2:', err);
+                cleanup();
+                reject(err);
+            }
+        });
     }
 
     // =========================================================================
@@ -292,17 +355,50 @@
             recaptchaV3Token: recaptchaToken
         };
 
-        try {
-            const response = await fetch(CONFIG.endpoints.createEvaluation, {
+        // Функция отправки запроса (с возможностью подмены токена на v2)
+        async function makeRequest(v2Token) {
+            const body = v2Token
+                ? { ...payload, recaptchaV2Token: v2Token, recaptchaV3Token: undefined }
+                : payload;
+
+            return fetch(CONFIG.endpoints.createEvaluation, {
                 method: "POST",
                 credentials: "include",
                 headers: {
                     "Content-Type": "application/json",
                     "Accept": "*/*"
                 },
-                body: JSON.stringify(payload)
+                body: JSON.stringify(body)
             });
+        }
 
+        try {
+            // 1) Первая попытка с v3-токеном
+            let response = await makeRequest(null);
+
+            // 2) Если 429 "prompt failed" — arena.ai требует reCAPTCHA v2
+            if (response.status === 429) {
+                let errBody = null;
+                try { errBody = await response.clone().json(); } catch (_) {}
+                const errMsg = errBody?.error || '';
+
+                if (errMsg === 'prompt failed' || errMsg.includes('recaptcha')) {
+                    console.log('[arena-bridge] ⚠️ Сервер запросил reCAPTCHA v2 (prompt failed)');
+                    updateUI('busy', '🔒 CAPTCHA required...');
+
+                    try {
+                        const v2Token = await getRecaptchaV2Token();
+                        console.log('[arena-bridge] 🔓 v2 токен получен, повторяю запрос...');
+                        updateUI('busy', `Retrying (${reqId.slice(0, 6)})...`);
+                        response = await makeRequest(v2Token);
+                    } catch (captchaErr) {
+                        console.error('[arena-bridge] ❌ reCAPTCHA v2 не решена:', captchaErr);
+                        throw new Error(`Arena требует CAPTCHA, но v2 не удалось: ${captchaErr.message}`);
+                    }
+                }
+            }
+
+            // 3) Проверяем итоговый ответ
             if (!response.ok) {
                 let errDetail = `HTTP ${response.status} ${response.statusText}`;
                 try {
@@ -316,6 +412,7 @@
                 throw new Error(`Arena API Error (${response.status}): ${errDetail}`);
             }
 
+            // 4) Читаем стрим ответа
             const reader = response.body.getReader();
             const decoder = new TextDecoder("utf-8");
             let buffer = "";
