@@ -2,7 +2,7 @@
 
 Всё просто:
 1. На телефоне или ПК крутится лёгкий локальный сервер на Python (`http://127.0.0.1:8000`).
-2. В браузере (на вкладке `arena.ai/text/direct`) висит юзерскрипт (через Tampermonkey).
+2. В браузере (на вкладке `arena.ai`) висит юзерскрипт (через Tampermonkey).
 3. Сервер и вкладка общаются между собой по WebSocket.
 4. Когда вы отправляете сообщение из SillyTavern, сервер передаёт его юзерскрипту, тот делает запрос от лица вашего браузера на arena.ai со всеми вашими куками, забирает ответ и стримит обратно в таверну.
 5. После каждого ответа чат на arena.ai **автоматически удаляется**, чтобы не засорять историю.
@@ -18,7 +18,7 @@
 
 ```bash
 pkg update -y && pkg install -y git python
-git clone https://github.com/MrKiyoto/idontknow.git arena-bridge
+git clone https://github.com/MrKiyoto/arenabridge.git arena-bridge
 cd arena-bridge
 chmod +x install_termux.sh run.sh
 ./install_termux.sh
@@ -72,7 +72,7 @@ chmod +x install_termux.sh run.sh
 1. Убедитесь, что установлен Python 3.10+.
 2. Склонируйте репозиторий:
    ```bash
-   git clone https://github.com/MrKiyoto/idontknow.git arena-bridge
+   git clone https://github.com/MrKiyoto/arenabridge.git arena-bridge
    cd arena-bridge
    python -m venv venv
    ```
@@ -87,7 +87,7 @@ chmod +x install_termux.sh run.sh
    python -m server
    ```
 5. В браузере (Chrome / Firefox / Edge с Tampermonkey) откройте `http://127.0.0.1:8000/userscript.user.js` и установите скрипт.
-6. Откройте `https://arena.ai/text/direct` и оставьте вкладку открытой.
+6. Откройте `https://arena.ai/` и оставьте вкладку открытой.
 
 ---
 
