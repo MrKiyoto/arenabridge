@@ -72,48 +72,6 @@
     }
 
     // =========================================================================
-    // ФОНОВЫЙ РЕЖИМ ДЛЯ ANDROID (Защита от засыпания вкладки)
-    // =========================================================================
-    let bgAudio = null;
-    let bgAudioActive = false;
-
-    function initBackgroundKeepAlive() {
-        if (bgAudio) return;
-        try {
-            // Беззвучный WAV-аудиопоток (44 байта)
-            bgAudio = new Audio("data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=");
-            bgAudio.loop = true;
-            bgAudio.volume = 0.001;
-        } catch (e) {
-            console.warn('[arena-bridge] Не удалось инициализировать Audio:', e);
-        }
-    }
-
-    function toggleBackgroundKeepAlive(forcedState) {
-        initBackgroundKeepAlive();
-        if (!bgAudio) return;
-
-        const shouldPlay = (forcedState !== undefined) ? forcedState : bgAudio.paused;
-        if (shouldPlay) {
-            bgAudio.play().then(() => {
-                bgAudioActive = true;
-                console.log('[arena-bridge] 🎵 Фоновый режим ВКЛ (вкладка не уснёт при переключении).');
-                updateUI();
-            }).catch(e => {
-                console.warn('[arena-bridge] Автозапуск аудио требует первого клика по странице:', e);
-            });
-        } else {
-            bgAudio.pause();
-            bgAudioActive = false;
-            updateUI();
-        }
-    }
-
-    // Активируем фоновый режим по первому тапу / клику пользователя
-    window.addEventListener('click', () => { if (!bgAudioActive) toggleBackgroundKeepAlive(true); }, { once: true });
-    window.addEventListener('touchstart', () => { if (!bgAudioActive) toggleBackgroundKeepAlive(true); }, { once: true });
-
-    // =========================================================================
     // ИНТЕРФЕЙС СТАТУСА (UI HUD)
     // =========================================================================
     let statusEl = null;
@@ -141,12 +99,9 @@
             display: flex;
             align-items: center;
             gap: 8px;
-            cursor: pointer;
             user-select: none;
             transition: all 0.2s ease;
         `;
-        statusEl.title = "Нажмите, чтобы включить/выключить фоновый режим для Android";
-        statusEl.onclick = () => toggleBackgroundKeepAlive();
         document.body.appendChild(statusEl);
         updateUI();
     }
@@ -160,12 +115,9 @@
         if (currentBridgeStatus === 'connected') dotColor = '#22c55e';
         else if (currentBridgeStatus === 'busy') dotColor = '#eab308';
 
-        const bgIcon = bgAudioActive ? '🎵 Фоновый: ВКЛ' : '🔇 Фон: выкл (кликните)';
-
         statusEl.innerHTML = `
             <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dotColor};"></span>
             <span><b>Bridge:</b> ${currentBridgeMessage}</span>
-            <span style="color:#94a3b8;font-size:10px;border-left:1px solid #475569;padding-left:6px;">${bgIcon}</span>
         `;
     }
 
